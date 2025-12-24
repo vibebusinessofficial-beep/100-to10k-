@@ -386,6 +386,7 @@ def main_menu() -> ReplyKeyboardMarkup:
             [KeyboardButton("📄 Последние сделки"), KeyboardButton("📌 Дневной курс")],
             [KeyboardButton("⚙️ Курс ПРОДАЖИ"), KeyboardButton("⚙️ Курс ПОКУПКИ")],
             [KeyboardButton("🧾 Должники"), KeyboardButton("🤝 Рефералы")],
+            [KeyboardButton("👥 Сотрудники")],
             [KeyboardButton("📌 Подробное ЗП")],
             [KeyboardButton("❌ Отмена")],
         ],
@@ -457,7 +458,9 @@ W_AED, W_RUB, W_CLIENT, W_CLOSER, W_ASSIGNER, W_REFERRER_PICK, W_RESERVE_PICK, W
 # Rate wizard states
 R_SELL, R_BUY = range(2)
 # Reserve menu states
-RV_MENU = range(1)[0]
+RV_MENU, RV_PICK_ACTION, RV_DELTA, RV_NEW_NAME = range(10, 14)
+# Staff menu states
+ST_MENU, ST_ADD_NAME, ST_ADD_USERNAME, ST_ADD_TGID, ST_ADD_ROLE, ST_ADD_PERCENT, ST_EDIT_NAME, ST_EDIT_USERNAME, ST_EDIT_ROLE, ST_EDIT_PERCENT = range(20, 30)
 # Debts states
 D_CREATE_NAME, D_CREATE_CONTACTS, D_CREATE_AMOUNT, D_CREATE_SINCE, D_CREATE_NOTE = range(100, 105)
 # Referrers states
@@ -852,66 +855,383 @@ async def set_deals_chat(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("✅ Этот чат теперь *СДЕЛКИ*. Я буду дублировать сюда сделки.", reply_markup=main_menu())
 
 # ---------- Reserves menu ----------
+def reserves_keyboard(reserves: List[sqlite3.Row]) -> InlineKeyboardMarkup:
+    buttons = []
+    for r in reserves:
+        buttons.append([InlineKeyboardButton(f"{r['name']} ({r['balance']:.2f})", callback_data=f"rv:{r['id']}")])
+    buttons.append([InlineKeyboardButton("➕ Добавить резерв", callback_data="rv:add")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="rv:back")])
+    return InlineKeyboardMarkup(buttons)
+
+def reserve_actions_keyboard(rid: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("➕ Пополнить", callback_data=f"rvact:{rid}:plus"), InlineKeyboardButton("➖ Списать", callback_data=f"rvact:{rid}:minus")],
+        [InlineKeyboardButton("🗑 Удалить резерв", callback_data=f"rvact:{rid}:delete")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="rv:back")],
+    ])
+
 async def reserves_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
     reserves = list_reserves("AED")
+    if update.callback_query:
+        q = update.callback_query
+        await q.answer()
+        target = q.message
+    else:
+        target = update.message
+
     if not reserves:
-        await update.message.reply_text("🏦 Резервы пустые. Создадим первый?\nНапиши: `+ Касса Влад`", reply_markup=back_cancel_kb())
-        context.user_data["rv_mode"] = "create_first"
+        await target.reply_text(
+            "🏦 Резервы пустые. Создадим первый?",
+            reply_markup=InlineKeyboardMarkup([
+                [InlineKeyboardButton("➕ Добавить резерв", callback_data="rv:add")],
+                [InlineKeyboardButton("⬅️ Назад", callback_data="rv:back")],
+            ]),
+        )
         return RV_MENU
 
     lines = ["🏦 *Резервы (AED)*:"]
     for r in reserves:
-        lines.append(f"• {r['id']}) *{r['name']}* = `{r['balance']:.2f}`")
-    lines.append("\nЧтобы создать: `+ Название`\nЧтобы изменить баланс: `id +/- сумма` (пример: `3 + 100` или `2 - 50`)")
+        lines.append(f"• {r['name']} = `{r['balance']:.2f}`")
 
-    await update.message.reply_text("\n".join(lines), reply_markup=back_cancel_kb())
+    await target.reply_text("\n".join(lines), reply_markup=reserves_keyboard(reserves), parse_mode="Markdown")
     return RV_MENU
 
-async def reserves_menu_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+async def reserves_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+
+    if data == "rv:back":
+        await q.edit_message_reply_markup(None)
+        return await back_any(update, context)
+
+    if data == "rv:add":
+        await q.edit_message_text("Название нового резерва:")
+        return RV_NEW_NAME
+
+    m = re.fullmatch(r"rv:(\d+)", data)
+    if not m:
+        await q.edit_message_text("Не понял выбор резерва.")
+        return RV_MENU
+
+    rid = int(m.group(1))
+    rr = get_reserve(rid)
+    if not rr:
+        await q.edit_message_text("Резерв не найден.")
+        return RV_MENU
+
+    context.user_data["rv_current"] = rid
+    txt = f"🏦 *{rr['name']}*\nБаланс: `{rr['balance']:.2f}`"
+    await q.edit_message_text(txt, reply_markup=reserve_actions_keyboard(rid), parse_mode="Markdown")
+    return RV_PICK_ACTION
+
+async def reserves_new_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = (update.message.text or "").strip()
     if t in ("⬅️ Назад", "❌ Отмена"):
         return await back_any(update, context)
+    rid = create_reserve(t, "AED", 0.0)
+    await update.message.reply_text("✅ Резерв создан.", reply_markup=back_cancel_kb())
+    context.user_data["rv_current"] = rid
+    return await reserves_menu(update, context)
 
-    # создать: + name
-    if t.startswith("+"):
-        name = t[1:].strip()
-        if not name:
-            await update.message.reply_text("Напиши так: `+ Касса Влад`", reply_markup=back_cancel_kb())
-            return RV_MENU
-        create_reserve(name, "AED", 0.0)
-        await update.message.reply_text("✅ Резерв создан.", reply_markup=back_cancel_kb())
+async def reserves_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+
+    if data == "rv:back":
         return await reserves_menu(update, context)
 
-    # изменить баланс: "id + 100" или "id - 50"
-    m = re.fullmatch(r"(\d+)\s*([+-])\s*([\d.,]+)", t)
-    if m:
-        rid = int(m.group(1))
-        op = m.group(2)
-        amt = float(m.group(3).replace(",", "."))
-        if amt <= 0:
-            await update.message.reply_text("Сумма должна быть > 0", reply_markup=back_cancel_kb())
-            return RV_MENU
-        rr = get_reserve(rid)
-        if not rr:
-            await update.message.reply_text("Не нашёл резерв с таким id.", reply_markup=back_cancel_kb())
-            return RV_MENU
-        delta = amt if op == "+" else -amt
-        apply_reserve_delta(rid, delta, "manual_adjust", update.effective_user.id)
-        await update.message.reply_text(f"✅ Ок. {rr['name']} теперь = {get_reserve(rid)['balance']:.2f}", reply_markup=back_cancel_kb())
+    m = re.fullmatch(r"rvact:(\d+):(plus|minus|delete)", data)
+    if not m:
+        await q.edit_message_text("Не понял действие.")
+        return RV_PICK_ACTION
+
+    rid = int(m.group(1))
+    action = m.group(2)
+    rr = get_reserve(rid)
+    if not rr:
+        await q.edit_message_text("Резерв не найден.")
         return RV_MENU
 
-    await update.message.reply_text("Не понял. Примеры:\n`+ Касса Дима`\n`3 + 100`\n`2 - 50`", reply_markup=back_cancel_kb())
-    return RV_MENU
+    context.user_data["rv_current"] = rid
+    if action == "delete":
+        delete_reserve(rid)
+        await q.edit_message_text(f"🗑 Резерв {rr['name']} удалён.")
+        return await reserves_menu(update, context)
+
+    context.user_data["rv_action"] = action
+    await q.edit_message_text("На сколько изменить баланс? Введи число (например 150):")
+    return RV_DELTA
+
+async def reserves_change_balance(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = (update.message.text or "").strip()
+    if t in ("⬅️ Назад", "❌ Отмена"):
+        return await back_any(update, context)
+    try:
+        amt = float(t.replace(",", "."))
+    except Exception:
+        await update.message.reply_text("Нужно число. Пример: 150", reply_markup=back_cancel_kb())
+        return RV_DELTA
+    if amt <= 0:
+        await update.message.reply_text("Сумма должна быть > 0", reply_markup=back_cancel_kb())
+        return RV_DELTA
+
+    rid = context.user_data.get("rv_current")
+    action = context.user_data.get("rv_action")
+    rr = get_reserve(rid) if rid else None
+    if not rr:
+        await update.message.reply_text("Резерв не найден.", reply_markup=main_menu())
+        return ConversationHandler.END
+
+    delta = amt if action == "plus" else -amt
+    apply_reserve_delta(rid, delta, "manual_adjust", update.effective_user.id)
+    updated = get_reserve(rid)
+    await update.message.reply_text(f"✅ Готово. {updated['name']} = {updated['balance']:.2f}", reply_markup=back_cancel_kb())
+    return await reserves_menu(update, context)
+
+# ---------- Staff ----------
+def list_staff() -> List[sqlite3.Row]:
+    with db() as conn:
+        return conn.execute("SELECT * FROM users ORDER BY display_name").fetchall()
+
+def get_staff(tg_id: int) -> Optional[sqlite3.Row]:
+    with db() as conn:
+        return conn.execute("SELECT * FROM users WHERE tg_id=?", (tg_id,)).fetchone()
+
+def staff_inline(rows: List[sqlite3.Row]) -> InlineKeyboardMarkup:
+    buttons = []
+    for r in rows:
+        buttons.append([InlineKeyboardButton(f"{r['display_name'] or r['username'] or r['tg_id']}", callback_data=f"st:{r['tg_id']}")])
+    buttons.append([InlineKeyboardButton("➕ Добавить", callback_data="st:add")])
+    buttons.append([InlineKeyboardButton("⬅️ Назад", callback_data="st:back")])
+    return InlineKeyboardMarkup(buttons)
+
+def staff_edit_kb(tg_id: int) -> InlineKeyboardMarkup:
+    return InlineKeyboardMarkup([
+        [InlineKeyboardButton("✏️ Имя", callback_data=f"stedit:{tg_id}:name"), InlineKeyboardButton("✏️ Ник", callback_data=f"stedit:{tg_id}:user")],
+        [InlineKeyboardButton("🎭 Роль", callback_data=f"stedit:{tg_id}:role"), InlineKeyboardButton("📌 %", callback_data=f"stedit:{tg_id}:percent")],
+        [InlineKeyboardButton("🗑 Удалить", callback_data=f"stedit:{tg_id}:delete")],
+        [InlineKeyboardButton("⬅️ Назад", callback_data="st:back")],
+    ])
+
+async def staff_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    rows = list_staff()
+    text = ["👥 *Сотрудники*:"]
+    if rows:
+        for r in rows:
+            text.append(f"• {r['display_name'] or '-'} ({r['username'] or '-'}) — {r['role']} / {float(r['base_percent']):.1f}%")
+    else:
+        text.append("Пока никого нет. Нажми 'Добавить'.")
+
+    target = update.callback_query.message if update.callback_query else update.message
+    if update.callback_query:
+        await update.callback_query.answer()
+    await target.reply_text("\n".join(text), reply_markup=staff_inline(rows), parse_mode="Markdown")
+    return ST_MENU
+
+async def staff_menu_click(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+
+    if data == "st:back":
+        await q.edit_message_reply_markup(None)
+        return await back_any(update, context)
+
+    if data == "st:add":
+        await q.edit_message_text("Имя сотрудника:")
+        return ST_ADD_NAME
+
+    m = re.fullmatch(r"st:(\d+)", data)
+    if not m:
+        await q.edit_message_text("Не понял выбор сотрудника.")
+        return ST_MENU
+
+    tg_id = int(m.group(1))
+    row = get_staff(tg_id)
+    if not row:
+        await q.edit_message_text("Сотрудник не найден.")
+        return ST_MENU
+
+    context.user_data["st_current"] = tg_id
+    txt = (
+        f"👤 *{row['display_name'] or '-'}*\n"
+        f"@{row['username'] or '-'}\n"
+        f"Роль: `{row['role']}`\n"
+        f"Базовый %: `{float(row['base_percent']):.1f}`"
+    )
+    await q.edit_message_text(txt, reply_markup=staff_edit_kb(tg_id), parse_mode="Markdown")
+    return ST_MENU
+
+async def staff_add_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = (update.message.text or "").strip()
+    if t in ("⬅️ Назад", "❌ Отмена"):
+        return await back_any(update, context)
+    context.user_data["_st_new_name"] = t
+    await update.message.reply_text("Ник в телеграм (без @ или '-' если нет):", reply_markup=back_cancel_kb())
+    return ST_ADD_USERNAME
+
+async def staff_add_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = (update.message.text or "").strip()
+    if t in ("⬅️ Назад", "❌ Отмена"):
+        return await back_any(update, context)
+    username = "" if t == "-" else t.lstrip("@")
+    context.user_data["_st_new_username"] = username
+    await update.message.reply_text("Telegram ID (числом):", reply_markup=back_cancel_kb())
+    return ST_ADD_TGID
+
+async def staff_add_tgid(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = (update.message.text or "").strip()
+    if t in ("⬅️ Назад", "❌ Отмена"):
+        return await back_any(update, context)
+    if not t.isdigit():
+        await update.message.reply_text("Нужно число (Telegram ID).", reply_markup=back_cancel_kb())
+        return ST_ADD_TGID
+    context.user_data["_st_new_tgid"] = int(t)
+    await update.message.reply_text("Роль (admin/assistant/staff):", reply_markup=back_cancel_kb())
+    return ST_ADD_ROLE
+
+async def staff_add_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = (update.message.text or "").strip().lower()
+    if t in ("⬅️ Назад", "❌ Отмена"):
+        return await back_any(update, context)
+    if t not in ("admin", "assistant", "staff"):
+        await update.message.reply_text("Варианты: admin / assistant / staff", reply_markup=back_cancel_kb())
+        return ST_ADD_ROLE
+    context.user_data["_st_new_role"] = t
+    await update.message.reply_text("Базовый процент (например 5):", reply_markup=back_cancel_kb())
+    return ST_ADD_PERCENT
+
+async def staff_add_percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = (update.message.text or "").strip()
+    if t in ("⬅️ Назад", "❌ Отмена"):
+        return await back_any(update, context)
+    try:
+        pct = float(t.replace(",", "."))
+    except Exception:
+        await update.message.reply_text("Нужно число. Пример: 7.5", reply_markup=back_cancel_kb())
+        return ST_ADD_PERCENT
+
+    name = context.user_data.pop("_st_new_name", "")
+    username = context.user_data.pop("_st_new_username", "")
+    tg_id = context.user_data.pop("_st_new_tgid", None)
+    role = context.user_data.pop("_st_new_role", "staff")
+    if tg_id is None:
+        await update.message.reply_text("Не нашёл ID. Начни заново.", reply_markup=main_menu())
+        return ConversationHandler.END
+
+    with db() as conn:
+        conn.execute(
+            """
+            INSERT INTO users(tg_id, username, display_name, role, base_percent) VALUES(?,?,?,?,?)
+            ON CONFLICT(tg_id) DO UPDATE SET username=excluded.username, display_name=excluded.display_name, role=excluded.role, base_percent=excluded.base_percent
+            """,
+            (tg_id, username, name, role, pct),
+        )
+    await update.message.reply_text("✅ Сотрудник сохранён.", reply_markup=main_menu())
+    return ConversationHandler.END
+
+async def staff_edit(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    q = update.callback_query
+    await q.answer()
+    data = q.data
+    m = re.fullmatch(r"stedit:(\d+):(name|user|role|percent|delete)", data)
+    if not m:
+        await q.edit_message_text("Не понял действие.")
+        return ST_MENU
+
+    tg_id = int(m.group(1))
+    field = m.group(2)
+    context.user_data["st_current"] = tg_id
+
+    if field == "delete":
+        with db() as conn:
+            conn.execute("DELETE FROM users WHERE tg_id=?", (tg_id,))
+        await q.edit_message_text("🗑 Сотрудник удалён.")
+        return await staff_menu(update, context)
+
+    prompts = {
+        "name": "Новое имя:",
+        "user": "Новый ник (без @ или '-' если убрать):",
+        "role": "Новая роль (admin/assistant/staff):",
+        "percent": "Новый базовый %:",
+    }
+    context.user_data["st_edit_field"] = field
+    await q.edit_message_text(prompts[field])
+    return {
+        "name": ST_EDIT_NAME,
+        "user": ST_EDIT_USERNAME,
+        "role": ST_EDIT_ROLE,
+        "percent": ST_EDIT_PERCENT,
+    }[field]
+
+async def staff_edit_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = (update.message.text or "").strip()
+    if t in ("⬅️ Назад", "❌ Отмена"):
+        return await back_any(update, context)
+    tg_id = context.user_data.get("st_current")
+    with db() as conn:
+        conn.execute("UPDATE users SET display_name=? WHERE tg_id=?", (t, tg_id))
+    await update.message.reply_text("✅ Имя обновлено.", reply_markup=main_menu())
+    return ConversationHandler.END
+
+async def staff_edit_username(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = (update.message.text or "").strip()
+    if t in ("⬅️ Назад", "❌ Отмена"):
+        return await back_any(update, context)
+    username = "" if t == "-" else t.lstrip("@")
+    tg_id = context.user_data.get("st_current")
+    with db() as conn:
+        conn.execute("UPDATE users SET username=? WHERE tg_id=?", (username, tg_id))
+    await update.message.reply_text("✅ Ник обновлён.", reply_markup=main_menu())
+    return ConversationHandler.END
+
+async def staff_edit_role(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = (update.message.text or "").strip().lower()
+    if t in ("⬅️ Назад", "❌ Отмена"):
+        return await back_any(update, context)
+    if t not in ("admin", "assistant", "staff"):
+        await update.message.reply_text("Варианты: admin / assistant / staff", reply_markup=back_cancel_kb())
+        return ST_EDIT_ROLE
+    tg_id = context.user_data.get("st_current")
+    with db() as conn:
+        conn.execute("UPDATE users SET role=? WHERE tg_id=?", (t, tg_id))
+    await update.message.reply_text("✅ Роль обновлена.", reply_markup=main_menu())
+    return ConversationHandler.END
+
+async def staff_edit_percent(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    t = (update.message.text or "").strip()
+    if t in ("⬅️ Назад", "❌ Отмена"):
+        return await back_any(update, context)
+    try:
+        pct = float(t.replace(",", "."))
+    except Exception:
+        await update.message.reply_text("Нужно число. Пример: 5", reply_markup=back_cancel_kb())
+        return ST_EDIT_PERCENT
+    tg_id = context.user_data.get("st_current")
+    with db() as conn:
+        conn.execute("UPDATE users SET base_percent=? WHERE tg_id=?", (pct, tg_id))
+    await update.message.reply_text("✅ % обновлён.", reply_markup=main_menu())
+    return ConversationHandler.END
 
 # ---------- Debts ----------
 async def debts_menu(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("🧾 Должники:\n- Добавить: нажми 'Добавить'\n- Список: /debts_list", reply_markup=ReplyKeyboardMarkup([[KeyboardButton("Добавить"), KeyboardButton("❌ Отмена")]], resize_keyboard=True))
+    await update.message.reply_text(
+        "🧾 Должники:\n- Добавить: нажми 'Добавить'\n- Список: нажми 'Список'",
+        reply_markup=ReplyKeyboardMarkup(
+            [[KeyboardButton("Добавить"), KeyboardButton("Список")], [KeyboardButton("❌ Отмена")]], resize_keyboard=True
+        ),
+    )
     return D_CREATE_NAME
 
 async def debts_create_name(update: Update, context: ContextTypes.DEFAULT_TYPE):
     t = (update.message.text or "").strip()
     if t == "Добавить":
         await update.message.reply_text("Имя должника:", reply_markup=back_cancel_kb())
+        return D_CREATE_NAME
+    if t == "Список":
+        await debts_list_cmd(update, context)
         return D_CREATE_NAME
     if t in ("⬅️ Назад", "❌ Отмена"):
         return await back_any(update, context)
@@ -1158,6 +1478,9 @@ async def menu_router(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if t == "🤝 Рефералы":
         return await referrers_menu(update, context)
 
+    if t == "👥 Сотрудники":
+        return await staff_menu(update, context)
+
     if t == "📌 Подробное ЗП":
         await detailed_payroll(update, context)
         return ConversationHandler.END
@@ -1217,10 +1540,15 @@ def main():
         allow_reentry=True,
     )
 
-    # Reserves conv (text menu)
+    # Reserves conv (buttons)
     reserves_conv = ConversationHandler(
         entry_points=[MessageHandler(filters.Regex(r"^🏦 Резервы$"), reserves_menu)],
-        states={RV_MENU: [MessageHandler(filters.TEXT & ~filters.COMMAND, reserves_menu_input)]},
+        states={
+            RV_MENU: [CallbackQueryHandler(reserves_menu_click, pattern=r"^rv:")],
+            RV_PICK_ACTION: [CallbackQueryHandler(reserves_action, pattern=r"^rvact:"), CallbackQueryHandler(reserves_menu_click, pattern=r"^rv:back$")],
+            RV_NEW_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, reserves_new_name)],
+            RV_DELTA: [MessageHandler(filters.TEXT & ~filters.COMMAND, reserves_change_balance)],
+        },
         fallbacks=[MessageHandler(filters.Regex(r"^(⬅️ Назад|❌ Отмена)$"), back_any)],
         allow_reentry=True,
     )
@@ -1251,12 +1579,32 @@ def main():
         allow_reentry=True,
     )
 
+    # Staff conv
+    staff_conv = ConversationHandler(
+        entry_points=[MessageHandler(filters.Regex(r"^👥 Сотрудники$"), staff_menu)],
+        states={
+            ST_MENU: [CallbackQueryHandler(staff_menu_click, pattern=r"^st:"), CallbackQueryHandler(staff_edit, pattern=r"^stedit:")],
+            ST_ADD_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, staff_add_name)],
+            ST_ADD_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, staff_add_username)],
+            ST_ADD_TGID: [MessageHandler(filters.TEXT & ~filters.COMMAND, staff_add_tgid)],
+            ST_ADD_ROLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, staff_add_role)],
+            ST_ADD_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, staff_add_percent)],
+            ST_EDIT_NAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, staff_edit_name)],
+            ST_EDIT_USERNAME: [MessageHandler(filters.TEXT & ~filters.COMMAND, staff_edit_username)],
+            ST_EDIT_ROLE: [MessageHandler(filters.TEXT & ~filters.COMMAND, staff_edit_role)],
+            ST_EDIT_PERCENT: [MessageHandler(filters.TEXT & ~filters.COMMAND, staff_edit_percent)],
+        },
+        fallbacks=[MessageHandler(filters.Regex(r"^(⬅️ Назад|❌ Отмена)$"), back_any)],
+        allow_reentry=True,
+    )
+
     app.add_handler(sell_rate_conv)
     app.add_handler(buy_rate_conv)
     app.add_handler(deal_conv)
     app.add_handler(reserves_conv)
     app.add_handler(debts_conv)
     app.add_handler(refs_conv)
+    app.add_handler(staff_conv)
 
     # Menu router (последним)
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, menu_router))
